@@ -2,6 +2,8 @@ securecookie
 ============
 [![GoDoc](https://godoc.org/github.com/gorilla/securecookie?status.svg)](https://godoc.org/github.com/gorilla/securecookie) [![Build Status](https://travis-ci.org/gorilla/securecookie.png?branch=master)](https://travis-ci.org/gorilla/securecookie)
 
+> v2: a work-in-progress.
+
 securecookie encodes and decodes authenticated and optionally encrypted 
 cookie values.
 
