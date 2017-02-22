@@ -9,17 +9,18 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/gob"
-	"encoding/json"
 	"fmt"
 	"hash"
-	"io"
 	"strconv"
 	"time"
+
+	"golang.org/x/crypto/nacl/secretbox"
+
+	scrypt "github.com/elithrar/simple-scrypt"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -82,14 +83,13 @@ func New(key [32]byte, opts *Options) (*SecureCookie, error) {
 
 	if opts.RotatedKeys != nil {
 		for idx, v := range opts.RotatedKeys {
-			// ...
+			// TODO(matt): If there are keys, set tryKeys = true?
+			// Rotated keys are only used for decryption attempts.
 		}
 	}
 
 	s := &SecureCookie{
-		hashKey:   hashKey,
-		blockKey:  blockKey,
-		hashFunc:  sha256.New,
+		key:       key,
 		maxAge:    86400 * 30,
 		maxLength: 4096,
 		sz:        GobEncoder{},
@@ -102,11 +102,13 @@ func New(key [32]byte, opts *Options) (*SecureCookie, error) {
 // cookie values.
 type SecureCookie struct {
 	key       []byte
-	block     cipher.AEAD
+	stretched bool
+	encrypter cipher.AEAD
 	maxLength int
 	maxAge    int64
 	minAge    int64
 	sz        Serializer
+	opts      *Options
 	// For testing purposes, the function that returns the current timestamp.
 	// If not set, it will use time.Now().UTC().Unix().
 	timeFunc func() int64
@@ -179,7 +181,7 @@ func (s *SecureCookie) BlockFunc(f func([]byte) (cipher.Block, error)) *SecureCo
 	return s
 }
 
-// Encoding sets the encoding/serialization method for cookies.
+// SetSerializer sets the encoding/serialization method for cookies.
 //
 // Default is encoding/gob.  To encode special structures using encoding/gob,
 // they must be registered first using gob.Register().
@@ -202,13 +204,46 @@ func (s *SecureCookie) SetSerializer(sz Serializer) *SecureCookie {
 // the current serialization/encryption settings on s and then base64-encoded,
 // is shorter than the maximum permissible length.
 func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
-	if s.err != nil {
-		return "", s.err
+	// 1. Check that the key exists
+	// 2. Check whether we have KDF'ed the key yet (once only)
+	// 3. Serialize our payload
+	// 4. Check whether s.encrypt == true
+	// 5. Generate our payload: name.expiry.data
+	// 6. sign or encrypt
+	// 7. encode to base64 URL safe
+	// 8. Check that the maximum length does not exceed s.maxLenght (4096 by default)
+	// 9. Return string(encoded)able
+
+	var encoded string
+
+	if s.key == nil {
+		return encoded, errHashKeyNotSet
 	}
-	if s.hashKey == nil {
-		s.err = errHashKeyNotSet
-		return "", s.err
+
+	// Run the provided key through a KDF (once only).
+	if !s.stretched {
+		var err error
+		if s.key, err = stretchKey(s.key); err != nil {
+			return "", errInvalidKey
+		}
 	}
+
+	var payload []byte
+	// TODO(matt): create a helper here: generatePayload?
+	if s.opts.EncryptCookies {
+		// Encrypt and early return
+		payload = []byte(fmt.Sprintf("%s|%d", name, s.timestamp()))
+		if payload, err = s.encrypt(payload); err != nil {
+			return "", errEncryptionFailed
+		}
+	} else {
+		// HMAC -> return
+	}
+
+	// base64.URLEncoding.EncodeToString
+	// Check length - len(encoded) > s.maxLength
+	// return encoded, nil
+
 	var err error
 	var b []byte
 	// 1. Serialize.
@@ -334,16 +369,21 @@ func verifyMac(h hash.Hash, value []byte, mac []byte) error {
 
 // Authentication -------------------------------------------------------------
 
-// sign ...
+// sign returns a signature for the provided data.
 //
 // Internally, sign uses HMAC-SHA-512/256, which is HMAC-SHA-512 truncated to a
 // 256-bit output to prevent length-extension attacks.
 func (s *SecureCookie) sign(data []byte) ([]byte, error) {
+	mac := hmac.New(sha512.New512_256, s.key)
+	mac.Write(data)
 
-	return nil, errSigningFailed
+	return mac.Sum(nil), nil
 }
 
-// verify ...
+// verify validates that the provided data matches the given signature.
+//
+// verify uses HMAC-SHA-512/256 for signatures and performs a constant-time
+// comparison of signatures using Go's hmac.Equal function.
 func (s *SecureCookie) verify(data []byte, actualMAC []byte) bool {
 	mac := hmac.New(sha512.New512_256, s.key)
 	mac.Write(data)
@@ -354,127 +394,67 @@ func (s *SecureCookie) verify(data []byte, actualMAC []byte) bool {
 
 // Encryption -----------------------------------------------------------------
 
-// encrypt encrypts the provided data, and returns a concatenation of nonce+ciphertext.
+// encrypt encrypts the provided data using nacl/secretbox, and returns a
+// concatenation of nonce+ciphertext.
 //
-// Interally, encrypt uses ChaCha20+Poly1305 (an AEAD; combining a stream
-// cipher & MAC construct) and generates a random, 96-bit nonce using Go's
+// Interally, encrypt uses XSalsa20+Poly1305 (an AEAD; combining a stream
+// cipher & MAC construct) and generates a random, 192-bit nonce using Go's
 // crypto/rand library, which leverages /dev/urandom or the equivalent on all
-// platforms.
+// platforms. A random nonce is used to prevent nonce re-use issues, and does
+// not require the package or package user to increment nonces.
 func (s *SecureCookie) encrypt(data []byte) ([]byte, error) {
+	// 1. Check our key is not nil
+	if s.key == nil {
+		return nil, errInvalidKey
+	}
 
-	return nil, errEncryptionFailed
+	// 2. Check that our data is not nil
+	if data == nil {
+		return nil, errInvalidData
+	}
+
+	// 3. Generate a fresh 96 bit nonce
+	nonce, err := GenerateRandomBytes(12)
+	if err != nil {
+		return nil, errors.Wrap(err, "encryption failed")
+	}
+
+	// 4. Encrypt our data, appending the ciphertext to the nonce.
+	return secretbox.Seal(nonce[:], data, nonce, s.key), nil
 }
 
-// decrypt decrypts the provided nonce+ciphertext.
-func (s *SecureCookie) decrypt(nonceCiphertext []byte) ([]byte, error) {
-
-	return nil, errDecryptionFailed
-}
-
-// encrypt encrypts a value using the given block in counter mode.
+// decrypt decrypts the provided nonce+ciphertext using nacl/secretbox.
 //
-// A random initialization vector (http://goo.gl/zF67k) with the length of the
-// block size is prepended to the resulting ciphertext.
-func encrypt(block cipher.Block, value []byte) ([]byte, error) {
-	iv := GenerateRandomKey(block.BlockSize())
-	if iv == nil {
-		return nil, errGeneratingIV
-	}
-	// Encrypt it.
-	stream := cipher.NewCTR(block, iv)
-	stream.XORKeyStream(value, value)
-	// Return iv + ciphertext.
-	return append(iv, value...), nil
-}
-
-// decrypt decrypts a value using the given block in counter mode.
-//
-// The value to be decrypted must be prepended by a initialization vector
-// (http://goo.gl/zF67k) with the length of the block size.
-func decrypt(block cipher.Block, value []byte) ([]byte, error) {
-	size := block.BlockSize()
-	if len(value) > size {
-		// Extract iv.
-		iv := value[:size]
-		// Extract ciphertext.
-		value = value[size:]
-		// Decrypt it.
-		stream := cipher.NewCTR(block, iv)
-		stream.XORKeyStream(value, value)
-		return value, nil
-	}
-	return nil, errDecryptionFailed
-}
-
-// Serialization --------------------------------------------------------------
-
-// Serialize encodes a value using gob.
-func (e GobEncoder) Serialize(src interface{}) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	enc := gob.NewEncoder(buf)
-	if err := enc.Encode(src); err != nil {
-		return nil, cookieError{cause: err, typ: usageError}
-	}
-	return buf.Bytes(), nil
-}
-
-// Deserialize decodes a value using gob.
-func (e GobEncoder) Deserialize(src []byte, dst interface{}) error {
-	dec := gob.NewDecoder(bytes.NewBuffer(src))
-	if err := dec.Decode(dst); err != nil {
-		return cookieError{cause: err, typ: decodeError}
-	}
-	return nil
-}
-
-// Serialize encodes a value using encoding/json.
-func (e JSONEncoder) Serialize(src interface{}) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	enc := json.NewEncoder(buf)
-	if err := enc.Encode(src); err != nil {
-		return nil, cookieError{cause: err, typ: usageError}
-	}
-	return buf.Bytes(), nil
-}
-
-// Deserialize decodes a value using encoding/json.
-func (e JSONEncoder) Deserialize(src []byte, dst interface{}) error {
-	dec := json.NewDecoder(bytes.NewReader(src))
-	if err := dec.Decode(dst); err != nil {
-		return cookieError{cause: err, typ: decodeError}
-	}
-	return nil
-}
-
-// Serialize passes a []byte through as-is.
-func (e NopEncoder) Serialize(src interface{}) ([]byte, error) {
-	if b, ok := src.([]byte); ok {
-		return b, nil
+// It expects that the the 196-bit nonce is prepended to the ciphertext.
+func (s *SecureCookie) decrypt(encrypted []byte) ([]byte, error) {
+	if s.key == nil {
+		return nil, errInvalidKey
 	}
 
-	return nil, errValueNotByte
-}
-
-// Deserialize passes a []byte through as-is.
-func (e NopEncoder) Deserialize(src []byte, dst interface{}) error {
-	if _, ok := dst.([]byte); ok {
-		dst = src
-		return nil
+	if encrypted == nil || len(encrypted) < 24 {
+		return nil, errDecryptionFailed
 	}
 
-	return errValueNotByte
+	// 3. Parse our nonce
+	nonce := encrypted[24:]
+	ptext, ok := secretbox.Open([]byte{}, encrypted[24:], nonce, s.key)
+	if !ok {
+		return nil, errDecryptionFailed
+	}
+
+	return ptext, nil
 }
 
 // Encoding -------------------------------------------------------------------
 
-// encode encodes a value using base64.
+// encode encodes a value using URL-safe base64.
 func encode(value []byte) []byte {
 	encoded := make([]byte, base64.URLEncoding.EncodedLen(len(value)))
 	base64.URLEncoding.Encode(encoded, value)
 	return encoded
 }
 
-// decode decodes a cookie using base64.
+// decode decodes a cookie using URL-safe base64.
 func decode(value []byte) ([]byte, error) {
 	decoded := make([]byte, base64.URLEncoding.DecodedLen(len(value)))
 	b, err := base64.URLEncoding.Decode(decoded, value)
@@ -486,18 +466,24 @@ func decode(value []byte) ([]byte, error) {
 
 // Helpers --------------------------------------------------------------------
 
-// GenerateRandomKey creates a random key with the given length in bytes.
-// On failure, returns nil.
-//
-// Callers should explicitly check for the possibility of a nil return, treat
-// it as a failure of the system random number generator, and not continue.
-func GenerateRandomKey(length int) []byte {
-	k := make([]byte, length)
-	if _, err := io.ReadFull(rand.Reader, k); err != nil {
-		return nil
-	}
-	return k
+// GenerateRandomBytes returns securely generated random bytes.
+// It will return an error if the system's secure random
+// number generator fails to function correctly, in which
+// case the caller should not continue.
+func GenerateRandomBytes(n int) ([]byte, error) {
+	b := make([]byte, n)
+	_, err := rand.Read(b)
+	// Note that err == nil only if we read len(b) bytes.
+	return b, err
 }
+
+// stretchKey passes the provided authentication/encryption key through a KDF
+// (scrypt) to improve the entropy of the key used
+func stretchKey(key []byte) ([]byte, error) {
+	return scrypt.GenerateFromPassword(key, scrypt.DefaultParams)
+}
+
+// TODO(matt): RotatedEncrypt / RotatedDecrypt?
 
 // CodecsFromPairs returns a slice of SecureCookie instances.
 //

@@ -71,6 +71,7 @@ var (
 	errGeneratingIV = cookieError{typ: internalError, msg: "failed to generate random iv"}
 
 	errNoCodecs            = cookieError{typ: usageError, msg: "no codecs provided"}
+	errInvalidKey          = cookieError{typ: usageError, msg: "no key was provided"}
 	errHashKeyNotSet       = cookieError{typ: usageError, msg: "hash key is not set"}
 	errBlockKeyNotSet      = cookieError{typ: usageError, msg: "block key is not set"}
 	errEncodedValueTooLong = cookieError{typ: usageError, msg: "the value is too long"}
