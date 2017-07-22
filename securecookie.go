@@ -601,6 +601,22 @@ func DecodeMulti(name string, value string, dst interface{}, codecs ...Codec) er
 	return errors
 }
 
+func DecodeMultiWithMaxAge(name string, value string, dst interface{}, maxAge int, codecs ...Codec) error {
+	if len(codecs) == 0 {
+		return errNoCodecs
+	}
+
+	var errors MultiError
+	for _, codec := range codecs {
+		err := codec.Decode(name, value, dst, maxAge)
+		if err == nil {
+			return nil
+		}
+		errors = append(errors, err)
+	}
+	return errors
+}
+
 // MultiError groups multiple errors.
 type MultiError []error
 
