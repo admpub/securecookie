@@ -115,7 +115,7 @@ var (
 // Codec defines an interface to encode and decode cookie values.
 type Codec interface {
 	Encode(name string, value interface{}) (string, error)
-	Decode(name, value string, dst interface{}) error
+	Decode(name, value string, dst interface{}, maxAge ...int) error
 }
 
 // New returns a new SecureCookie.
@@ -300,7 +300,7 @@ func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
 // The name argument is the cookie name. It must be the same name used when
 // it was stored. The value argument is the encoded cookie value. The dst
 // argument is where the cookie will be decoded. It must be a pointer.
-func (s *SecureCookie) Decode(name, value string, dst interface{}) error {
+func (s *SecureCookie) Decode(name, value string, dst interface{}, maxAges ...int) error {
 	if s.err != nil {
 		return s.err
 	}
@@ -336,7 +336,11 @@ func (s *SecureCookie) Decode(name, value string, dst interface{}) error {
 	if s.minAge != 0 && t1 > t2-s.minAge {
 		return errTimestampTooNew
 	}
-	if s.maxAge != 0 && t1 < t2-s.maxAge {
+	maxAge := s.maxAge
+	if len(maxAges) > 0 {
+		maxAge = int64(maxAges[0])
+	}
+	if maxAge != 0 && t1 < t2-maxAge {
 		return errTimestampExpired
 	}
 	// 5. Decrypt (optional).
